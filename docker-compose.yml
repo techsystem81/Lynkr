@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  claude-proxy:
+    build: .
+    container_name: claude-proxy
+    ports:
+      - "8080:8080"
+      - "8888:8888"
+    environment:
+      DATABRICKS_API_BASE: ${DATABRICKS_API_BASE:-https://example.cloud.databricks.com}
+      DATABRICKS_API_KEY: ${DATABRICKS_API_KEY:-replace-with-databricks-pat}
+      WEB_SEARCH_ENDPOINT: ${WEB_SEARCH_ENDPOINT:-http://localhost:8888/search}
+      WORKSPACE_ROOT: ${WORKSPACE_ROOT:-/workspace}
+    volumes:
+      - ./data:/app/data
+      - .:/workspace
+    restart: unless-stopped

@@ -1,0 +1,301 @@
+const path = require("path");
+const dotenv = require("dotenv");
+
+dotenv.config();
+
+function trimTrailingSlash(value) {
+  if (typeof value !== "string") return value;
+  return value.replace(/\/$/, "");
+}
+
+function parseJson(value, fallback = null) {
+  if (typeof value !== "string" || value.trim().length === 0) return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function parseList(value, options = {}) {
+  if (typeof value !== "string" || value.trim().length === 0) return [];
+  const separator = options.separator ?? ",";
+  return value
+    .split(separator)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function parseMountList(value) {
+  if (typeof value !== "string" || value.trim().length === 0) return [];
+  return value
+    .split(";")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const parts = entry.split(":");
+      if (parts.length < 2) return null;
+      const host = parts[0]?.trim();
+      const container = parts[1]?.trim();
+      const mode = parts[2]?.trim() || "rw";
+      if (!host || !container) return null;
+      return {
+        host: path.resolve(host),
+        container,
+        mode,
+      };
+    })
+    .filter(Boolean);
+}
+
+function resolveConfigPath(targetPath) {
+  if (typeof targetPath !== "string" || targetPath.trim().length === 0) {
+    return null;
+  }
+  let normalised = targetPath.trim();
+  if (normalised.startsWith("~")) {
+    const home = process.env.HOME || process.env.USERPROFILE;
+    if (home) {
+      normalised = path.join(home, normalised.slice(1));
+    }
+  }
+  return path.resolve(normalised);
+}
+
+const SUPPORTED_MODEL_PROVIDERS = new Set(["databricks", "azure-anthropic"]);
+const rawModelProvider = (process.env.MODEL_PROVIDER ?? "databricks").toLowerCase();
+const modelProvider = SUPPORTED_MODEL_PROVIDERS.has(rawModelProvider)
+  ? rawModelProvider
+  : "databricks";
+
+const rawBaseUrl = trimTrailingSlash(process.env.DATABRICKS_API_BASE);
+const apiKey = process.env.DATABRICKS_API_KEY;
+
+const azureAnthropicEndpoint = process.env.AZURE_ANTHROPIC_ENDPOINT ?? null;
+const azureAnthropicApiKey = process.env.AZURE_ANTHROPIC_API_KEY ?? null;
+const azureAnthropicVersion = process.env.AZURE_ANTHROPIC_VERSION ?? "2023-06-01";
+
+if (modelProvider === "databricks" && (!rawBaseUrl || !apiKey)) {
+  throw new Error("Set DATABRICKS_API_BASE and DATABRICKS_API_KEY before starting the proxy.");
+}
+
+if (modelProvider === "azure-anthropic" && (!azureAnthropicEndpoint || !azureAnthropicApiKey)) {
+  throw new Error(
+    "Set AZURE_ANTHROPIC_ENDPOINT and AZURE_ANTHROPIC_API_KEY before starting the proxy.",
+  );
+}
+
+const endpointPath =
+  process.env.DATABRICKS_ENDPOINT_PATH ??
+  "/serving-endpoints/databricks-claude-sonnet-4-5/invocations";
+
+const databricksUrl =
+  rawBaseUrl && endpointPath
+    ? `${rawBaseUrl}${endpointPath.startsWith("/") ? "" : "/"}${endpointPath}`
+    : null;
+
+const defaultModel =
+  process.env.MODEL_DEFAULT ??
+  (modelProvider === "azure-anthropic" ? "claude-opus-4-5" : "databricks-claude-sonnet-4-5");
+
+const port = Number.parseInt(process.env.PORT ?? "8080", 10);
+const sessionDbPath =
+  process.env.SESSION_DB_PATH ?? path.join(process.cwd(), "data", "sessions.db");
+const workspaceRoot = path.resolve(process.env.WORKSPACE_ROOT ?? process.cwd());
+
+const defaultWebEndpoint = process.env.WEB_SEARCH_ENDPOINT ?? "http://localhost:8888/search";
+let webEndpointHost = null;
+try {
+  const { hostname } = new URL(defaultWebEndpoint);
+  webEndpointHost = hostname.toLowerCase();
+} catch {
+  webEndpointHost = null;
+}
+
+const allowAllWebHosts = process.env.WEB_SEARCH_ALLOW_ALL !== "false";
+const configuredAllowedHosts =
+  process.env.WEB_SEARCH_ALLOWED_HOSTS?.split(",")
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean) ?? [];
+const webAllowedHosts = allowAllWebHosts
+  ? null
+  : new Set([webEndpointHost, "localhost", "127.0.0.1"].filter(Boolean).concat(configuredAllowedHosts));
+const webTimeoutMs = Number.parseInt(process.env.WEB_SEARCH_TIMEOUT_MS ?? "10000", 10);
+
+const policyMaxSteps = Number.parseInt(process.env.POLICY_MAX_STEPS ?? "8", 10);
+const policyMaxToolCalls = Number.parseInt(process.env.POLICY_MAX_TOOL_CALLS ?? "12", 10);
+const policyDisallowedTools =
+  process.env.POLICY_DISALLOWED_TOOLS?.split(",")
+    .map((tool) => tool.trim())
+    .filter(Boolean) ?? [];
+const policyGitAllowPush = process.env.POLICY_GIT_ALLOW_PUSH === "true";
+const policyGitAllowPull = process.env.POLICY_GIT_ALLOW_PULL !== "false";
+const policyGitAllowCommit = process.env.POLICY_GIT_ALLOW_COMMIT !== "false";
+const policyGitTestCommand = process.env.POLICY_GIT_TEST_COMMAND ?? null;
+const policyGitRequireTests = process.env.POLICY_GIT_REQUIRE_TESTS === "true";
+const policyGitCommitRegex = process.env.POLICY_GIT_COMMIT_REGEX ?? null;
+const policyGitAutoStash = process.env.POLICY_GIT_AUTOSTASH === "true";
+
+const sandboxEnabled = process.env.MCP_SANDBOX_ENABLED !== "false";
+const sandboxImage = process.env.MCP_SANDBOX_IMAGE ?? null;
+const sandboxRuntime = process.env.MCP_SANDBOX_RUNTIME ?? "docker";
+const sandboxContainerWorkspace =
+  process.env.MCP_SANDBOX_CONTAINER_WORKSPACE ?? "/workspace";
+const sandboxMountWorkspace = process.env.MCP_SANDBOX_MOUNT_WORKSPACE !== "false";
+const sandboxAllowNetworking = process.env.MCP_SANDBOX_ALLOW_NETWORKING === "true";
+const sandboxNetworkMode = sandboxAllowNetworking
+  ? process.env.MCP_SANDBOX_NETWORK_MODE ?? "bridge"
+  : "none";
+const sandboxPassthroughEnv = parseList(
+  process.env.MCP_SANDBOX_PASSTHROUGH_ENV ?? "PATH,LANG,LC_ALL,TERM,HOME",
+);
+const sandboxExtraMounts = parseMountList(process.env.MCP_SANDBOX_EXTRA_MOUNTS ?? "");
+const sandboxDefaultTimeoutMs = Number.parseInt(
+  process.env.MCP_SANDBOX_TIMEOUT_MS ?? "20000",
+  10,
+);
+const sandboxUser = process.env.MCP_SANDBOX_USER ?? null;
+const sandboxEntrypoint = process.env.MCP_SANDBOX_ENTRYPOINT ?? null;
+const sandboxReuseSessions = process.env.MCP_SANDBOX_REUSE_SESSION !== "false";
+
+const sandboxPermissionMode =
+  (process.env.MCP_SANDBOX_PERMISSION_MODE ?? "auto").toLowerCase();
+const sandboxPermissionAllow = parseList(process.env.MCP_SANDBOX_PERMISSION_ALLOW ?? "");
+const sandboxPermissionDeny = parseList(process.env.MCP_SANDBOX_PERMISSION_DENY ?? "");
+
+const sandboxManifestPath = resolveConfigPath(process.env.MCP_SERVER_MANIFEST ?? null);
+
+let manifestDirList = null;
+if (process.env.MCP_MANIFEST_DIRS === "") {
+  manifestDirList = [];
+} else if (process.env.MCP_MANIFEST_DIRS) {
+  manifestDirList = parseList(process.env.MCP_MANIFEST_DIRS);
+} else {
+  manifestDirList = ["~/.claude/mcp"];
+}
+const sandboxManifestDirs = manifestDirList
+  .map((dir) => resolveConfigPath(dir))
+  .filter((dir) => typeof dir === "string" && dir.length > 0);
+
+const promptCacheEnabled = process.env.PROMPT_CACHE_ENABLED !== "false";
+const promptCacheMaxEntriesRaw = Number.parseInt(
+  process.env.PROMPT_CACHE_MAX_ENTRIES ?? "64",
+  10,
+);
+const promptCacheTtlRaw = Number.parseInt(
+  process.env.PROMPT_CACHE_TTL_MS ?? "300000",
+  10,
+);
+
+const testDefaultCommand = process.env.WORKSPACE_TEST_COMMAND ?? null;
+const testDefaultArgs = parseList(process.env.WORKSPACE_TEST_ARGS ?? "");
+const testTimeoutMs = Number.parseInt(process.env.WORKSPACE_TEST_TIMEOUT_MS ?? "600000", 10);
+const testSandboxMode = (process.env.WORKSPACE_TEST_SANDBOX ?? "auto").toLowerCase();
+let testCoverageFiles = parseList(
+  process.env.WORKSPACE_TEST_COVERAGE_FILES ?? "coverage/coverage-summary.json",
+);
+if (testCoverageFiles.length === 0) {
+  testCoverageFiles = [];
+}
+const testProfiles = parseJson(process.env.WORKSPACE_TEST_PROFILES ?? "", null);
+
+const config = {
+  env: process.env.NODE_ENV ?? "development",
+  port: Number.isNaN(port) ? 8080 : port,
+  databricks: {
+    baseUrl: rawBaseUrl,
+    apiKey,
+    endpointPath,
+    url: databricksUrl,
+  },
+  azureAnthropic: {
+    endpoint: azureAnthropicEndpoint,
+    apiKey: azureAnthropicApiKey,
+    version: azureAnthropicVersion,
+  },
+  modelProvider: {
+    type: modelProvider,
+    defaultModel,
+  },
+  server: {
+    jsonLimit: process.env.REQUEST_JSON_LIMIT ?? "1gb",
+  },
+  logger: {
+    level: process.env.LOG_LEVEL ?? "info",
+  },
+  sessionStore: {
+    dbPath: sessionDbPath,
+  },
+  workspace: {
+    root: workspaceRoot,
+  },
+  webSearch: {
+    endpoint: defaultWebEndpoint,
+    apiKey: process.env.WEB_SEARCH_API_KEY ?? null,
+    allowedHosts: allowAllWebHosts ? null : Array.from(webAllowedHosts ?? []),
+    allowAllHosts: allowAllWebHosts,
+    enabled: true,
+    timeoutMs: Number.isNaN(webTimeoutMs) ? 10000 : webTimeoutMs,
+  },
+  policy: {
+    maxStepsPerTurn: Number.isNaN(policyMaxSteps) ? 8 : policyMaxSteps,
+    maxToolCallsPerTurn: Number.isNaN(policyMaxToolCalls) ? 12 : policyMaxToolCalls,
+    disallowedTools: policyDisallowedTools,
+    git: {
+      allowPush: policyGitAllowPush,
+      allowPull: policyGitAllowPull,
+      allowCommit: policyGitAllowCommit,
+      testCommand: policyGitTestCommand,
+      requireTests: policyGitRequireTests,
+      commitMessageRegex: policyGitCommitRegex,
+      autoStash: policyGitAutoStash,
+    },
+  },
+  mcp: {
+    sandbox: {
+      enabled: sandboxEnabled && Boolean(sandboxImage),
+      runtime: sandboxRuntime,
+      image: sandboxImage,
+      containerWorkspace: sandboxContainerWorkspace,
+      mountWorkspace: sandboxMountWorkspace,
+      allowNetworking: sandboxAllowNetworking,
+      networkMode: sandboxNetworkMode,
+      passthroughEnv: sandboxPassthroughEnv,
+      extraMounts: sandboxExtraMounts,
+      defaultTimeoutMs: Number.isNaN(sandboxDefaultTimeoutMs)
+        ? 20000
+        : sandboxDefaultTimeoutMs,
+      user: sandboxUser,
+      entrypoint: sandboxEntrypoint,
+      reuseSession: sandboxReuseSessions,
+    },
+    permissions: {
+      mode: ["auto", "require", "deny"].includes(sandboxPermissionMode)
+        ? sandboxPermissionMode
+        : "auto",
+      allow: sandboxPermissionAllow,
+      deny: sandboxPermissionDeny,
+    },
+    servers: {
+      manifestPath: sandboxManifestPath,
+      manifestDirs: sandboxManifestDirs,
+    },
+  },
+  promptCache: {
+    enabled: promptCacheEnabled,
+    maxEntries: Number.isNaN(promptCacheMaxEntriesRaw) ? 64 : promptCacheMaxEntriesRaw,
+    ttlMs: Number.isNaN(promptCacheTtlRaw) ? 300000 : promptCacheTtlRaw,
+  },
+  tests: {
+    defaultCommand: testDefaultCommand ? testDefaultCommand.trim() : null,
+    defaultArgs: testDefaultArgs,
+    timeoutMs: Number.isNaN(testTimeoutMs) ? 600000 : testTimeoutMs,
+    sandbox: ["always", "never", "auto"].includes(testSandboxMode) ? testSandboxMode : "auto",
+    coverage: {
+      files: testCoverageFiles,
+    },
+    profiles: Array.isArray(testProfiles) ? testProfiles : null,
+  },
+};
+
+module.exports = config;
